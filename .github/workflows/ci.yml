@@ -1,0 +1,99 @@
+name: CI
+
+# Offline checks only: nothing here talks to Klaviyo or Snowflake, and no
+# secrets are used. dbt (transform/) is not run because it needs Snowflake.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "29 9 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    # On PRs, only run the jobs the diff can reach. Push to main, schedule and
+    # manual runs always run everything (see the `if:` on each job).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      java: ${{ steps.filter.outputs.java }}
+      python: ${{ steps.filter.outputs.python }}
+      lint: ${{ steps.filter.outputs.lint }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            java:
+              - 'src/**'
+              - 'pom.xml'
+              - '.github/workflows/ci.yml'
+            python:
+              # tests/test_source_contract.py reads the Java sources and sql/.
+              - 'scripts/**'
+              - 'tests/**'
+              - 'src/**'
+              - 'sql/**'
+              - '.github/workflows/ci.yml'
+            lint:
+              - 'scripts/**'
+              - 'tests/**'
+              - 'ruff.toml'
+              - '.github/workflows/ci.yml'
+
+  maven:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.java == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17" # maven.compiler.release in pom.xml
+          cache: maven
+      - name: Build and unit test
+        run: mvn -B -ntp verify
+
+  python-tests:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Standard library only, so no dependency install or cache is needed.
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+  lint:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.lint == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.16.9
+      - name: ruff
+        run: ruff check scripts tests
+      - name: shellcheck (warnings and above; preinstalled on the runner)
+        run: shellcheck -S warning scripts/*.sh
